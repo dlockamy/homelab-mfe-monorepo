@@ -1,0 +1,5 @@
+{
+  "imports": {
+    "@mfe/sub-route-billing": "/artifacts/billing/v1793057375/main.js"
+  }
+}

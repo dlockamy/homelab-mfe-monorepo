@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Core Shell - MFE Monorepo Test Sandbox</title>
+    <style>
+        body { background: #0f0f12; color: #e2e2e9; font-family: system-ui, sans-serif; margin: 40px; }
+        .wrapper { max-width: 800px; margin: 0 auto; }
+        header { border-bottom: 1px solid #2d2d37; padding-bottom: 20px; margin-bottom: 30px; }
+        #app-mount { min-height: 200px; border: 2px dashed #2d2d37; border-radius: 12px; padding: 20px; display: flex; align-items: center; justify-content: center; }
+    </style>
+    
+    <!-- Dynamic Import Map Script Placeholder -->
+    <script type="importmap" id="mfe-import-map">
+    {
+      "imports": {}
+    }
+    </script>
+</head>
+<body>
+    <div class="wrapper">
+        <header>
+            <h1>Organisational Core Shell Layout</h1>
+            <p>Testing Dynamic Monorepo CDN Delivery Plans via CloudFront</p>
+            <button id="load-billing-btn" style="padding: 10px 15px; background: #3b82f6; border: none; color: #fff; border-radius: 6px; cursor: pointer; font-weight: 600;">
+                Mount Billing Route
+            </button>
+        </header>
+
+        <main id="app-mount">
+            <p style="color: #62627a;">Sub-route interface wrapper blank. Click mount to fetch live bundle.</p>
+        </main>
+    </div>
+
+    <script>
+        // Orchestration layer fetches the live pointer manifest dynamically from S3 root
+        async function bootstrap() {
+            try {
+                const res = await fetch('/importmap.json?nocache=' + Date.now());
+                const map = await res.json();
+                
+                document.getElementById('load-billing-btn').addEventListener('click', async () => {
+                    const mountPoint = document.getElementById('app-mount');
+                    mountPoint.innerHTML = '<p style="color: #62627a;">Fetching script from immutable asset endpoint...</p>';
+                    
+                    // Look up the asset location from the runtime manifest
+                    const billingScriptUrl = map.imports['@mfe/sub-route-billing'];
+                    
+                    if (!billingScriptUrl) {
+                        mountPoint.innerHTML = '<p style="color: #ef4444;">Error: Billing mapping path not found in importmap.json.</p>';
+                        return;
+                    }
+
+                    // Dynamically inject the script file into the document frame
+                    const script = document.createElement('script');
+                    script.src = billingScriptUrl;
+                    script.type = 'module';
+                    script.onload = () => {
+                        if (window.MFE_BILLING && window.MFE_BILLING.renderBilling) {
+                            mountPoint.innerHTML = '';
+                            window.MFE_BILLING.renderBilling('app-mount');
+                        }
+                    };
+                    script.onerror = () => {
+                        mountPoint.innerHTML = '<p style="color: #ef4444;">Network Error: Failed to execute script layer from ' + billingScriptUrl + '</p>';
+                    };
+                    document.head.appendChild(script);
+                });
+            } catch (err) {
+                console.error("Failed to load runtime release mapping manifest file:", err);
+            }
+        }
+        bootstrap();
+    </script>
+</body>
+</html>

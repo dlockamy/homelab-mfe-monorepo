@@ -1,0 +1,91 @@
+// Jenkinsfile-CD (Continuous Delivery / publish pipeline)
+
+pipeline {
+    agent any
+    environment {
+        AWS_DEFAULT_REGION = 'us-east-1'
+        S3_BUCKET = 'homelab-mfe-delivery-bucket'
+    }
+    stages {
+        stage('Detect Changes') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    def diffCmd = "git diff --name-only HEAD~1"
+                    def changedFiles = runPlatformCommand(diffCmd).trim()
+
+                    env.CORE_SHELL_CHANGED = changedFiles.contains("apps/core-shell/") ? "true" : "false"
+                    env.BILLING_CHANGED = changedFiles.contains("apps/sub-route-billing/") ? "true" : "false"
+
+                    echo "Core Shell Modified: ${env.CORE_SHELL_CHANGED}"
+                    echo "Billing Sub-route Modified: ${env.BILLING_CHANGED}"
+                }
+            }
+        }
+
+        stage('Build & Deploy Core Shell') {
+            when {
+                branch 'main'
+                environment name: 'CORE_SHELL_CHANGED', value: 'true'
+            }
+            steps {
+                dir('apps/core-shell') {
+                    script {
+                        runPlatformCommand('npm install && npm run build')
+                        runPlatformCommand("aws s3 cp dist/index.html s3://${env.S3_BUCKET}/index.html")
+                    }
+                }
+            }
+        }
+
+        stage('Build & Release Billing Sub-Route') {
+            when {
+                branch 'main'
+                environment name: 'BILLING_CHANGED', value: 'true'
+            }
+            steps {
+                dir('apps/sub-route-billing') {
+                    script {
+                        runPlatformCommand('npm install && npm run build')
+
+                        def version = "v${BUILD_NUMBER}"
+                        def assetPath = "artifacts/billing/${version}"
+
+                        echo "Publishing Immutable Artifacts to ${assetPath}"
+                        runPlatformCommand("aws s3 cp dist/main.js s3://${env.S3_BUCKET}/${assetPath}/main.js")
+
+                        echo "Executing Manifest Pointer Flip (Cross-Platform Node Script)"
+                        runPlatformCommand("aws s3 cp s3://${env.S3_BUCKET}/importmap.json ./importmap.json || echo {\"imports\":{}} > importmap.json")
+
+                        def nodeScript = """
+                        const fs = require('fs');
+                        let raw = fs.readFileSync('importmap.json');
+                        let data = JSON.parse(raw);
+                        if (!data.imports) data.imports = {};
+                        data.imports['@mfe/sub-route-billing'] = '/${assetPath}/main.js';
+                        fs.writeFileSync('importmap.json', JSON.stringify(data, null, 2));
+                        """
+                        writeFile file: 'update_map.js', text: nodeScript
+                        runPlatformCommand("node update_map.js")
+
+                        runPlatformCommand("aws s3 cp importmap.json s3://${env.S3_BUCKET}/importmap.json")
+
+                        echo "Pushing Prefixed Git Tag"
+                        runPlatformCommand("git tag apps-sub-route-billing-${version} && git push origin apps-sub-route-billing-${version}")
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Helper method to detect the runner OS and choose the right shell syntax
+def runPlatformCommand(String command) {
+    if (isUnix()) {
+        return sh(script: command, returnStdout: true)
+    } else {
+        return bat(script: command, returnStdout: true)
+    }
+}
