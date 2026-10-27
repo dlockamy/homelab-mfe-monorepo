@@ -20,6 +20,7 @@ terraform/              S3 (private) + CloudFront (OAC)
 - [Architecture](docs/architecture.md): how the service works, hosting, known gaps
 - [CI and CD](docs/ci-cd.md): the Jenkins pipelines, enabling deploys, troubleshooting
 - [Releasing, tagging and rollback](docs/releasing.md): per-component tags, finding what's live, going back
+- [Monorepo vs split repos](docs/monorepo-vs-split-repos.md): the trade-offs of keeping this one repo vs a shared npm package, for Jenkins and Harness.io
 
 ## Run it locally
 
