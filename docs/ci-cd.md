@@ -165,6 +165,7 @@ It cannot reach real AWS: credentials are throwaway and every call is pinned to
 
 | Symptom | Likely cause / fix |
 |---|---|
+| `dlockamy.cd/homelab-mfe-monorepo` doesn't exist | Expected until `Jenkinsfile.cd` is on `main`: the `.cd` folder only creates a job for repos whose default branch has that file. Merge, then scan `dlockamy.cd`. |
 | Repo not in Jenkins | Not scanned yet. Run *Scan Organization Folder Now* on `dlockamy` (and `dlockamy.cd`). Confirm the file is named exactly `Jenkinsfile` / `Jenkinsfile.cd`. |
 | `npm: not found` | Build ran outside the node container, typically an old `agent any` Jenkinsfile. `main` #1 failed this way before PR #1 merged. |
 | `docker: not found` | Landed on the controller. Check the pipeline has `agent { label 'linux-build' }`. |
@@ -183,8 +184,7 @@ end to end on a `linux-build` agent in `node:22-alpine` as UID 5005.
 
 Proven locally only: `publish.sh` (release, first release with no manifest,
 rollback, refusal paths) against LocalStack; both containers' behaviour; the
-tag commands against a scratch git remote. Both Jenkinsfiles pass Jenkins'
-Declarative linter.
+tag commands against a scratch git remote. Both Jenkinsfiles pass the Declarative linter on the production Jenkins itself.
 
 **Not yet exercised anywhere:** the CD pipeline running on Jenkins, real AWS,
 the Terraform apply, and the tag push from Jenkins to GitHub.
