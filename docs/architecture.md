@@ -41,7 +41,7 @@ sequenceDiagram
     B->>CF: GET /artifacts/billing/v42/main.js
     CF->>S3: artifact (cached 1 year at the edge)
     S3-->>B: billing bundle
-    Note over B: bundle sets window.MFE_BILLING;<br/>shell calls MFE_BILLING.renderBilling("app-mount")
+    Note over B: bundle sets window.MFE_BILLING,<br/>shell calls MFE_BILLING.renderBilling("app-mount")
 ```
 
 Details worth knowing:
