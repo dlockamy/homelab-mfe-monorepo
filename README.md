@@ -15,6 +15,12 @@ scripts/publish.sh      the one place that uploads to S3 (Jenkins AND make use i
 terraform/              S3 (private) + CloudFront (OAC)
 ```
 
+## Docs
+
+- [Architecture](docs/architecture.md): how the service works, hosting, known gaps
+- [CI and CD](docs/ci-cd.md): the Jenkins pipelines, enabling deploys, troubleshooting
+- [Releasing, tagging and rollback](docs/releasing.md): per-component tags, finding what's live, going back
+
 ## Run it locally
 
 Needs Docker, Node, `aws` CLI, Python 3. Uses LocalStack as a fake AWS — it
@@ -29,21 +35,7 @@ make help
 
 ## Jenkins
 
-| File | Job (via the `dlockamy` GitHub org folders) | Runs on |
-|---|---|---|
-| `Jenkinsfile` | `dlockamy/homelab-mfe-monorepo` — builds both apps | every branch + PR |
-| `Jenkinsfile.cd` | `dlockamy.cd/homelab-mfe-monorepo` — publishes | `main` only |
-
-Both run on label `linux-build` in `node:22-alpine`. New repos appear after the
-org folder's next scan (hourly) or a manual "Scan Organization Folder Now".
-
-### Turning on deploys
-
-`Jenkinsfile.cd` ships with `DEPLOY_ENABLED = 'false'`: it builds, then reports
-**UNSTABLE** ("built, not deployed"). To go live:
-
-1. `terraform -chdir=terraform apply` (creates the bucket + CloudFront; prints `cdn_domain`).
-2. Create an IAM user allowed only `s3:GetObject`, `s3:PutObject`,
-   `s3:ListBucket` on that bucket. Add its key to Jenkins as a
-   `usernamePassword` credential with id **`aws-homelab-mfe-deploy`**.
-3. Flip `DEPLOY_ENABLED` to `'true'` in a PR.
+`Jenkinsfile` (CI, every branch and PR) and `Jenkinsfile.cd` (CD, `main` only)
+are discovered automatically by the `dlockamy` org folders. Deploys ship
+**disabled** (`DEPLOY_ENABLED = 'false'`); see [docs/ci-cd.md](docs/ci-cd.md)
+for how to turn them on.

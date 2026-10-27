@@ -132,11 +132,18 @@ pipeline {
 
                 stage('Tag release') {
                     when {
-                        environment name: 'DEPLOY_ENABLED',  value: 'true'
-                        environment name: 'BILLING_CHANGED', value: 'true'
+                        environment name: 'DEPLOY_ENABLED', value: 'true'
+                        anyOf {
+                            environment name: 'CORE_SHELL_CHANGED', value: 'true'
+                            environment name: 'BILLING_CHANGED',    value: 'true'
+                        }
                     }
                     steps {
-                        // Single-quoted so the token is never Groovy-interpolated into the log.
+                        // One tag per component that was actually deployed in this
+                        // build: apps-<component>-v<BUILD_NUMBER>. For billing the
+                        // number is also the S3 artifact version, so the tag names
+                        // the exact commit behind /artifacts/billing/v<N>/main.js.
+                        // Single-quoted so the token is never Groovy-interpolated.
                         withCredentials([usernamePassword(
                             credentialsId: 'github-token',
                             usernameVariable: 'GH_USER',
@@ -144,10 +151,13 @@ pipeline {
                         )]) {
                             sh '''#!/bin/sh
                                 set -eu
-                                TAG="apps-sub-route-billing-v${BUILD_NUMBER}"
-                                git tag "$TAG"
-                                git -c credential.helper='!f() { echo "username=$GH_USER"; echo "password=$GH_TOKEN"; }; f' \
-                                    push origin "$TAG"
+                                push_tag() {
+                                    git tag "$1"
+                                    git -c credential.helper='!f() { echo "username=$GH_USER"; echo "password=$GH_TOKEN"; }; f' \
+                                        push origin "$1"
+                                }
+                                if [ "$CORE_SHELL_CHANGED" = true ]; then push_tag "apps-core-shell-v${BUILD_NUMBER}"; fi
+                                if [ "$BILLING_CHANGED"    = true ]; then push_tag "apps-sub-route-billing-v${BUILD_NUMBER}"; fi
                             '''
                         }
                     }
