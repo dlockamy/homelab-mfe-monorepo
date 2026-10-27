@@ -1,10 +1,26 @@
+# Local development against LocalStack (a fake AWS). Nothing here touches real AWS:
+# every aws call goes to $(LOCALSTACK_URL) and uses throwaway credentials.
+#
+# The publish logic itself lives in scripts/publish.sh — the same script
+# Jenkinsfile.cd runs — so `make build-billing` rehearses the real release.
+
 # Variables
 LOCALSTACK_URL=http://localhost:4566
 S3_BUCKET=homelab-mfe-delivery-bucket
 AWS_DEFAULT_REGION=us-east-1
 LOCAL_PORT?=8080
+LOCAL_CDN=.local-cdn
 
-.PHONY: all help init start-localstack stop-localstack build-shell build-billing simulate-pr-billing test-rollback clean serve-local run-local
+# Throwaway credentials, and drop any real profile, so a stray `aws` call can
+# never resolve real credentials. (Every call below also pins --endpoint-url.)
+export AWS_ACCESS_KEY_ID=test
+export AWS_SECRET_ACCESS_KEY=test
+export AWS_DEFAULT_REGION
+unexport AWS_PROFILE AWS_SESSION_TOKEN
+
+AWS_LOCAL=aws --endpoint-url=$(LOCALSTACK_URL)
+
+.PHONY: all help init start-localstack ensure-localstack stop-localstack build-shell build-billing sync-local simulate-pr-billing test-rollback clean serve-local run-local
 
 help: ## Show this help message
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -15,7 +31,7 @@ init: ## Install root and workspace project nodes
 	@echo "Installing project dependencies..."
 	npm install
 
-ensure-localstack: ## Ensure LocalStack is running and the mock S3 bucket exists
+ensure-localstack: ## Ensure LocalStack is running and the mock S3 bucket + manifest exist
 	@if docker ps -a --filter "name=^localstack-mfe$$" --format '{{.Names}}' | grep -q '^localstack-mfe$$'; then \
 		echo "Found existing LocalStack container; starting it if needed..."; \
 		docker start localstack-mfe >/dev/null; \
@@ -29,9 +45,11 @@ ensure-localstack: ## Ensure LocalStack is running and the mock S3 bucket exists
 		echo "Waiting for S3 runtime initialization ($$i/30)..."; \
 		sleep 2; \
 	done
-	@AWS_DEFAULT_REGION=$(AWS_DEFAULT_REGION) aws --endpoint-url=$(LOCALSTACK_URL) s3api head-bucket --bucket $(S3_BUCKET) >/dev/null 2>&1 || AWS_DEFAULT_REGION=$(AWS_DEFAULT_REGION) aws --endpoint-url=$(LOCALSTACK_URL) s3 mb s3://$(S3_BUCKET)
-	@echo '{"imports":{}}' > importmap.json
-	@AWS_DEFAULT_REGION=$(AWS_DEFAULT_REGION) aws --endpoint-url=$(LOCALSTACK_URL) s3 cp importmap.json s3://$(S3_BUCKET)/importmap.json
+	@$(AWS_LOCAL) s3api head-bucket --bucket $(S3_BUCKET) >/dev/null 2>&1 || $(AWS_LOCAL) s3 mb s3://$(S3_BUCKET)
+	@# Seed an empty manifest ONLY if there isn't one. (This used to overwrite it on
+	@# every target, so `make build-shell` silently took the billing route offline.)
+	@$(AWS_LOCAL) s3api head-object --bucket $(S3_BUCKET) --key importmap.json >/dev/null 2>&1 || \
+		echo '{"imports":{}}' | $(AWS_LOCAL) s3 cp - s3://$(S3_BUCKET)/importmap.json --content-type application/json
 
 start-localstack: ensure-localstack ## Boot up the community image and wait for internal S3 services to report ready
 
@@ -40,41 +58,25 @@ stop-localstack: ## Tear down LocalStack container
 	docker stop localstack-mfe || true
 	docker rm localstack-mfe || true
 
-build-shell: ensure-localstack ## Compile the Core Shell application and deploy to mock S3 root
+build-shell: ensure-localstack ## Compile the Core Shell application and publish it to mock S3
 	@echo "Compiling Core Shell application..."
 	@cd apps/core-shell && npm run build
-	@if [ -d "apps/core-shell/dist" ]; then \
-		echo "Uploading core index frame to S3..."; \
-		cp apps/core-shell/dist/index.html index.html; \
-		AWS_DEFAULT_REGION=$(AWS_DEFAULT_REGION) aws --endpoint-url=$(LOCALSTACK_URL) s3 cp apps/core-shell/dist/index.html s3://$(S3_BUCKET)/index.html; \
-	else \
-		echo "Error: core-shell build output missing."; exit 1; \
-	fi
+	@S3_BUCKET=$(S3_BUCKET) AWS_ENDPOINT_URL=$(LOCALSTACK_URL) scripts/publish.sh shell
 
-build-billing: ensure-localstack ## Compile Billing Sub-route with an incremental local build counter
+build-billing: ensure-localstack ## Compile Billing Sub-route and release it as v<timestamp> (immutable artifact + manifest flip)
 	@echo "Compiling Billing Sub-route..."
 	@cd apps/sub-route-billing && npm run build
-	@BUILD_NUM=$$(date +%s); \
-	ASSET_PATH="artifacts/billing/v$$BUILD_NUM"; \
-	mkdir -p $$ASSET_PATH; \
-	cp apps/sub-route-billing/dist/main.js $$ASSET_PATH/main.js; \
-	echo "Publishing Immutable Billing version v$$BUILD_NUM to mock CDN..." ; \
-	AWS_DEFAULT_REGION=$(AWS_DEFAULT_REGION) aws --endpoint-url=$(LOCALSTACK_URL) s3 cp apps/sub-route-billing/dist/main.js s3://$(S3_BUCKET)/$$ASSET_PATH/main.js; \
-	echo "Executing Manifest Pointer Flip via inline node logic..." ; \
-	AWS_DEFAULT_REGION=$(AWS_DEFAULT_REGION) aws --endpoint-url=$(LOCALSTACK_URL) s3 cp s3://$(S3_BUCKET)/importmap.json ./importmap.json || echo '{"imports":{}}' > importmap.json; \
-	node -e " \
-		const fs = require('fs'); \
-		let data = JSON.parse(fs.readFileSync('importmap.json')); \
-		if (!data.imports) data.imports = {}; \
-		data.imports['@mfe/sub-route-billing'] = '/$$ASSET_PATH/main.js'; \
-		fs.writeFileSync('importmap.json', JSON.stringify(data, null, 2)); \
-	"; \
-	AWS_DEFAULT_REGION=$(AWS_DEFAULT_REGION) aws --endpoint-url=$(LOCALSTACK_URL) s3 cp importmap.json s3://$(S3_BUCKET)/importmap.json; \
-	echo "Release completely live on mock network! Active bundle address: /$$ASSET_PATH/main.js"
+	@VERSION=v$$(date +%s); \
+	S3_BUCKET=$(S3_BUCKET) AWS_ENDPOINT_URL=$(LOCALSTACK_URL) scripts/publish.sh billing $$VERSION && \
+	echo "Release live on mock CDN. Active bundle: /artifacts/billing/$$VERSION/main.js"
 
-serve-local: ## Serve the built app from the repo root over HTTP so the browser can load the import map and bundle
+sync-local: ## Mirror the mock bucket into $(LOCAL_CDN)/ (what CloudFront would serve)
+	@mkdir -p $(LOCAL_CDN)
+	@$(AWS_LOCAL) s3 sync s3://$(S3_BUCKET) $(LOCAL_CDN) --delete --only-show-errors
+
+serve-local: sync-local ## Serve the mock bucket contents over HTTP so the browser can load the import map and bundle
 	@echo "Serving local app on http://localhost:$(LOCAL_PORT)"
-	@python3 -m http.server $(LOCAL_PORT) --directory .
+	@python3 -m http.server $(LOCAL_PORT) --directory $(LOCAL_CDN)
 
 run-local: ## Build the app and serve it locally
 	@$(MAKE) build-shell
@@ -86,13 +88,11 @@ simulate-pr-billing: ## Simulate a standalone Git PR merge updating only the bil
 	@echo "// Local update token: $$(date +%s)" >> apps/sub-route-billing/src/main.js
 	@$(MAKE) build-billing
 
-test-rollback: ## Instantly roll back the live application manifest to an empty import matrix
+test-rollback: ensure-localstack ## Instantly roll back the live application manifest to an empty import matrix
 	@echo "Executing instantaneous disaster recovery fallback state..."
-	@echo '{"imports": {}}' > rollback.json
-	AWS_DEFAULT_REGION=$(AWS_DEFAULT_REGION) aws --endpoint-url=$(LOCALSTACK_URL) s3 cp rollback.json s3://$(S3_BUCKET)/importmap.json
-	@rm rollback.json
+	@echo '{"imports": {}}' | $(AWS_LOCAL) s3 cp - s3://$(S3_BUCKET)/importmap.json --content-type application/json
 	@echo "Rollback completed. Manifest cleared."
 
 clean: ## Purge local build artifacts and node tracks
-	rm -rf node_modules apps/core-shell/dist apps/sub-route-billing/dist importmap.json index.html artifacts
+	rm -rf node_modules apps/core-shell/dist apps/sub-route-billing/dist $(LOCAL_CDN)
 	@echo "Cleanup completed."

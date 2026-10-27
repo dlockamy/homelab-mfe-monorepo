@@ -1,0 +1,178 @@
+// Jenkinsfile.cd — CD. Builds and publishes to S3 behind CloudFront.
+//
+// Discovered by the `dlockamy.cd` GitHub org folder (this file used to be
+// `Jenkinsfile-CD`, which no org folder looks for — hence never ran).
+// Only `main` publishes; other branches/PRs build nothing here (CI covers them).
+//
+// Release model:
+//   core-shell  -> overwrite s3://<bucket>/index.html
+//   billing     -> immutable s3://<bucket>/artifacts/billing/v<BUILD_NUMBER>/main.js,
+//                  then flip the "@mfe/sub-route-billing" pointer in importmap.json.
+//                  Rollback = point the manifest back at an older version.
+//
+// ── Deploy is OFF until you turn it on ───────────────────────────────────
+// DEPLOY_ENABLED below ships as 'false'. With it off this pipeline still
+// builds and goes UNSTABLE ("not deployed") so a merge never fails for want
+// of infrastructure that doesn't exist yet. To go live:
+//   1. `terraform apply` in terraform/ (creates the bucket + CloudFront).
+//   2. Create an IAM user limited to s3:GetObject/PutObject/ListBucket on that
+//      bucket, and add its key to Jenkins as a `usernamePassword` credential
+//      with id `aws-homelab-mfe-deploy` (same shape as `aws-sol-backup`).
+//   3. Flip DEPLOY_ENABLED to 'true' in a PR.
+//
+// Conventions (see Jenkinsfile for the full rationale): label 'linux-build'
+// not `agent any`; build as the Jenkins UID; the only root container is the
+// publish step, and it never writes into the workspace.
+
+pipeline {
+    agent { label 'linux-build' }
+
+    options {
+        timeout(time: 20, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+        // Two releases racing would interleave their read-modify-write of importmap.json.
+        disableConcurrentBuilds()
+    }
+
+    environment {
+        AWS_DEFAULT_REGION = 'us-east-1'
+        S3_BUCKET          = 'homelab-mfe-delivery-bucket'
+        DEPLOY_ENABLED     = 'false'
+    }
+
+    stages {
+        stage('Detect Changes') {
+            when { branch 'main' }
+            steps {
+                script {
+                    def files = changedFiles(env.GIT_PREVIOUS_SUCCESSFUL_COMMIT)
+                    // null == "can't tell" (first build, or the last good commit
+                    // is gone after a force-push): treat everything as changed.
+                    env.CORE_SHELL_CHANGED = (files == null || files.any { it.startsWith('apps/core-shell/') })       ? 'true' : 'false'
+                    env.BILLING_CHANGED    = (files == null || files.any { it.startsWith('apps/sub-route-billing/') }) ? 'true' : 'false'
+                    echo "Changed since ${env.GIT_PREVIOUS_SUCCESSFUL_COMMIT ?: '(no previous good build)'}: " +
+                         "core-shell=${env.CORE_SHELL_CHANGED} billing=${env.BILLING_CHANGED}"
+                }
+            }
+        }
+
+        stage('Build') {
+            when {
+                beforeAgent true
+                branch 'main'
+                anyOf {
+                    environment name: 'CORE_SHELL_CHANGED', value: 'true'
+                    environment name: 'BILLING_CHANGED',    value: 'true'
+                }
+            }
+            agent {
+                docker {
+                    image     'node:22-alpine'
+                    reuseNode true
+                    args      '-e HOME=/tmp -e npm_config_cache=/tmp/.npm'
+                }
+            }
+            steps {
+                script {
+                    if (env.CORE_SHELL_CHANGED == 'true') { dir('apps/core-shell')       { sh 'npm run build' } }
+                    if (env.BILLING_CHANGED    == 'true') { dir('apps/sub-route-billing') { sh 'npm run build' } }
+                }
+            }
+        }
+
+        stage('Publish') {
+            when {
+                branch 'main'
+                anyOf {
+                    environment name: 'CORE_SHELL_CHANGED', value: 'true'
+                    environment name: 'BILLING_CHANGED',    value: 'true'
+                }
+            }
+            stages {
+                stage('Deploy disabled') {
+                    when { environment name: 'DEPLOY_ENABLED', value: 'false' }
+                    steps {
+                        unstable('Built, NOT deployed: DEPLOY_ENABLED is false in Jenkinsfile.cd (see header for how to enable).')
+                    }
+                }
+
+                stage('Deploy to S3') {
+                    when {
+                        beforeAgent true
+                        environment name: 'DEPLOY_ENABLED', value: 'true'
+                    }
+                    agent {
+                        docker {
+                            image     'node:22-alpine'
+                            reuseNode true
+                            // Root so `apk add aws-cli` works. Safe here (and only here)
+                            // because publish.sh reads dist/ and writes solely to /tmp —
+                            // nothing root-owned lands in the shared workspace.
+                            args      '-u root -e HOME=/root'
+                        }
+                    }
+                    environment {
+                        BILLING_VERSION = "v${env.BUILD_NUMBER}"
+                    }
+                    steps {
+                        withCredentials([usernamePassword(
+                            credentialsId: 'aws-homelab-mfe-deploy',
+                            usernameVariable: 'AWS_ACCESS_KEY_ID',
+                            passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                        )]) {
+                            sh '''#!/bin/sh
+                                set -eu
+                                apk add --no-cache aws-cli >/dev/null
+                                if [ "$CORE_SHELL_CHANGED" = true ]; then scripts/publish.sh shell; fi
+                                if [ "$BILLING_CHANGED"    = true ]; then scripts/publish.sh billing "$BILLING_VERSION"; fi
+                            '''
+                        }
+                    }
+                }
+
+                stage('Tag release') {
+                    when {
+                        environment name: 'DEPLOY_ENABLED', value: 'true'
+                        anyOf {
+                            environment name: 'CORE_SHELL_CHANGED', value: 'true'
+                            environment name: 'BILLING_CHANGED',    value: 'true'
+                        }
+                    }
+                    steps {
+                        // One tag per component that was actually deployed in this
+                        // build: apps-<component>-v<BUILD_NUMBER>. For billing the
+                        // number is also the S3 artifact version, so the tag names
+                        // the exact commit behind /artifacts/billing/v<N>/main.js.
+                        // Single-quoted so the token is never Groovy-interpolated.
+                        withCredentials([usernamePassword(
+                            credentialsId: 'github-token',
+                            usernameVariable: 'GH_USER',
+                            passwordVariable: 'GH_TOKEN'
+                        )]) {
+                            sh '''#!/bin/sh
+                                set -eu
+                                push_tag() {
+                                    git tag "$1"
+                                    git -c credential.helper='!f() { echo "username=$GH_USER"; echo "password=$GH_TOKEN"; }; f' \
+                                        push origin "$1"
+                                }
+                                if [ "$CORE_SHELL_CHANGED" = true ]; then push_tag "apps-core-shell-v${BUILD_NUMBER}"; fi
+                                if [ "$BILLING_CHANGED"    = true ]; then push_tag "apps-sub-route-billing-v${BUILD_NUMBER}"; fi
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Files changed since `base`, or null if that can't be determined.
+// Runs on the agent host (plain git), not in a container.
+def changedFiles(String base) {
+    if (!base) { return null }
+    def reachable = sh(script: "git cat-file -e '${base}^{commit}'", returnStatus: true) == 0
+    if (!reachable) { return null }
+    def out = sh(script: "git diff --name-only '${base}' HEAD", returnStdout: true).trim()
+    return out ? out.split('\n') as List : []
+}
